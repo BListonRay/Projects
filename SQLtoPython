@@ -1,0 +1,228 @@
+import sqlalchemy as sa
+import pandas as pd
+
+def convert_time(time):
+    '''
+    Converts a time duration (in seconds) to minutes and seconds, and prints it in a readable format.
+
+    Parameters:
+        time (float or int): The time duration in seconds.
+
+    Returns:
+        None. The function prints the formatted time to the console.
+    '''
+    final_time = math.ceil(time)
+    mins = final_time // 60
+    secs = final_time % 60
+    print("Time to write: {}min {}sec".format(mins, secs))
+    
+
+#####################################################################################################################
+
+def sql_pull(table, db=None, vars='top 10 *', org='schema_name.dbo.', filter=0):
+    '''
+    Function to pull data in from the SQL Server.
+    ------
+    Inputs:
+        table - str - table name
+        vars - str - variables to pull in (first ten rows with all vars is default)
+        org - str - the organization/schema that the table comes from
+        filter - str/int - any filter specifications (0 means no filter)
+    ------
+    Outputs:
+        df - pandas dataframe of the specified SQL table
+    '''
+
+    try:
+        # define the connection details for the database
+        if db == 'analytics':
+            constring = (
+                'Driver={SQL Server};'
+                'Server=your_analytics_server_name;'
+                'Database=Analytics;'
+                'Trusted_Connection=yes;')
+        elif db == 'oasis':
+            constring = (
+                'Driver={SQL Server};'
+                'Server=your_oasis_server_name;'
+                'Database=Oasis;'
+                'Trusted_Connection=yes;')
+        else:  # Default to reports DB if no database is specified
+            constring = (
+                'Driver={SQL Server};'
+                'Server=your_default_server_name;'
+                'Database=Reports;'
+                'Trusted_Connection=yes;')
+        
+        connection_url = sa.engine.URL.create(
+           "mssql+pyodbc", 
+           query=dict(odbc_connect=constring)
+        )
+        
+        engine = sa.create_engine(connection_url, fast_executemany=True)
+        conn = engine.connect()
+        
+        if filter == 0:
+            query = "SELECT " + vars + " FROM " + org + table + ";"
+        else:
+            query = "SELECT " + vars + " FROM " + org + table + " WHERE " + filter + ";"
+        
+        results = conn.execute(sa.text(query))
+        df = pd.DataFrame(results.fetchall(), columns=results.keys())
+        conn.close()
+        
+        return df
+
+    except Exception as e:
+        print('Error: could not pull data from: {}'.format(table))
+        print("Exception details:", e)
+
+########################################################################################################################
+
+def sql_write(df, name, operation, update_values=None, condition=None, overview=None):
+    """
+    Function to perform operations (replace, append, update) in a SQL Server database as well as provide information for
+    Overview table update.
+    --------
+    Inputs:
+        df - pandas dataframe to write (only used for replace or append)
+        name - name of the table in SQL Server
+        operation - operation type ('replace', 'append', 'update')
+        update_values - dictionary of column-value pairs to update (only for update operation)
+        condition - SQL condition as a string for update operation (e.g., "id = 123")
+    --------
+    Outputs:
+        None
+    """
+    try:
+        connection_string = (
+            'Driver={ODBC Driver 17 for SQL Server};'
+            'Server=your_server_name_here;'
+            'Database=your_database_name_here;'
+            'Trusted_Connection=yes;'
+        )
+        connection_url = sa.engine.URL.create(
+            "mssql+pyodbc", 
+            query=dict(odbc_connect=connection_string)
+        )
+        engine = sa.create_engine(connection_url, fast_executemany=True)
+
+        start = time.time()
+
+        if operation == 'replace' or operation == 'append':
+            if df is None:
+                raise ValueError("DataFrame cannot be None for replace or append operations.")
+            df.to_sql(name, engine, schema="dbo", if_exists=operation, index=False)
+            print(f"Successfully wrote data to {name} using '{operation}' operation.")
+
+        elif operation == 'update':
+            if not update_values or not condition:
+                raise ValueError("update_values and condition are required for update operation.")
+            with engine.connect() as connection:
+                # Build the UPDATE SQL command
+                set_clause = ", ".join([f"{col} = :{col}" for col in update_values.keys()])
+                query = f"UPDATE {name} SET {set_clause} WHERE {condition}"
+                # Execute the query
+                connection.execute(sa.text(query), **update_values)
+            print(f"Successfully updated rows in {name} where {condition}.")
+
+        else:
+            raise ValueError(f"Invalid operation '{operation}'. Use 'replace', 'append', or 'update'.")
+
+        end = time.time()
+        elapsed_time = end - start
+        complete = "yes"
+        if overview is None:
+            return elapsed_time, complete
+
+    except Exception as e:
+        print(f"Error during '{operation}' operation on {name}: {e}")
+        complete = "no"
+        if overview is None:
+            return elapsed_time, complete
+
+################################################################################################################
+
+def batch_to_sql(data, tableName, batch_size=500000):
+    """
+    Function to write to SQL by batching
+
+    Parameters
+    ----------
+    data : TYPE
+        DESCRIPTION.
+    batch_size : TYPE, optional
+        DESCRIPTION. The default is 100000.
+
+    Returns
+    -------
+    None.
+
+    """
+    totTime= 0
+    for i in range(0, len(data), batch_size):
+        batch = data.iloc[i:i+batch_size]
+        if i==0:
+            time, complete= sql_write(batch, tableName, 'replace')
+        else:
+            time, complete= sql_write(batch, tableName, 'append')
+        totTime+= time
+    convert_time(totTime)
+    return totTime, complete
+
+##################################################################################################################
+
+def create_overview(stage, operation, table, success, time, snap):
+    """
+    Parameters
+    ----------
+    stage : int
+        The stage of the PMFE process.
+    operation : string
+        The operation being completed during the stage.
+    table : string
+        The table name being updated.
+    success : string
+        yes if table update was successful, no otherwise.
+    time : datetime
+        The time it took to update the table.
+    snap : datetime
+        the datetime that the table was updated.
+
+    Returns
+    -------
+    None.
+
+    """
+    # Data to be added to Overview table
+    dfAdd= {
+        'Stage': [stage],
+        'Operation': [operation],
+        'TableName': [table],
+        'SuccessfulUpdate': [success],  
+        'TimeToUpdate': [time],
+        'SnapDate': [snap]}
+
+    # Create the DataFrame from the dictionary
+    dfAdd = pd.DataFrame(dfAdd)
+    
+    return dfAdd
+
+####################################################################################################################
+
+## Usage example
+# Write to SQL Server
+result= batch_to_sql(df, 'PMFE_FinalData')
+
+
+# Update overview table
+dt= create_overview(13,'SettlementRates', 'PMFE_FinalData', result[1], secToTime(result[0]), SnapDate())
+sql_write(dt, 'PMFE_Overview', 'append', overview=1)  
+
+## Batch example
+# Write to SQL Server
+result= batch_to_sql(dataVars, 'PMFE_NewVarsModelData')
+
+# Update overview table
+dt= create_overview(4,'NewVars', 'PMFE_NewVarsModelData', result[1], secToTime(result[0]), SnapDate())
+sql_write(dt, 'PMFE_Overview', 'append', overview=1)
